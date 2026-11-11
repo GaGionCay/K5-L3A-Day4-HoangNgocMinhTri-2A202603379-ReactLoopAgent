@@ -1,6 +1,7 @@
 """Bốn provider cùng một interface. Không chứa agent loop."""
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 
@@ -11,17 +12,26 @@ CONFIG = {
     'anthropic': ('ANTHROPIC_API_KEY', 'https://api.anthropic.com/v1/messages'),
 }
 
-
 def post_json(url, headers, payload):
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json', **headers})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as response:
-            return json.load(response)
-    except urllib.error.HTTPError as exc:
-        # Do not print response bodies: they may contain account or request data.
-        raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
+    max_retries = 3 if any(domain in url for domain in ['generativelanguage.googleapis.com', 'openrouter.ai', 'api.openai.com']) else 0
+    for attempt in range(max_retries + 1):
+        req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json', **headers})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 429 and attempt < max_retries:
+                try:
+                    retry_after = exc.headers.get('Retry-After') if exc.headers else None
+                    delay = float(retry_after) if retry_after is not None else 2 ** attempt
+                except (TypeError, ValueError):
+                    delay = 2 ** attempt
+                time.sleep(min(max(delay, 0), 30))
+                continue
+            # Do not print response bodies: they may contain account or request data.
+            raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
 
 
 class Provider:
@@ -44,15 +54,35 @@ class Provider:
     def complete(self, messages, schemas):
         if self.name == 'anthropic':
             return self._anthropic(messages, schemas)
-        payload = {'model': self.model, 'messages': messages}
+            
+        # Xử lý tên model cho Gemini nếu cần thiết
+        model_name = self.model
+        if self.name == 'gemini' and model_name.startswith('models/'):
+            model_name = model_name.replace('models/', '')
+
+        payload = {'model': model_name, 'messages': messages}
+        
         if schemas:
-            payload['tools'] = schemas
+            # Đảm bảo format tool chuẩn OpenAI/Gemini compatibility
+            formatted_tools = []
+            for s in schemas:
+                if 'type' not in s:
+                    formatted_tools.append({'type': 'function', 'function': s})
+                else:
+                    formatted_tools.append(s)
+            payload['tools'] = formatted_tools
+
         data = post_json(self.url, {'Authorization': f'Bearer {self.key}'}, payload)
-        choice = data['choices'][0]
+        
+        # Phòng ngừa trường hợp cấu trúc trả về khác biệt
+        choices = data.get('choices', [])
+        if not choices:
+            raise RuntimeError(f"Provider trả về response không hợp lệ: {data}")
+            
+        choice = choices[0]
         message = choice['message']
         calls = [{'id': c['id'], 'name': c['function']['name'], 'arguments': c['function']['arguments']} for c in message.get('tool_calls', [])]
         return {'message': message, 'calls': calls, 'finish': choice.get('finish_reason'), 'usage': data.get('usage', {})}
-
     def _anthropic(self, messages, schemas):
         system = '\n'.join(m['content'] for m in messages if m['role'] == 'system')
         native = []

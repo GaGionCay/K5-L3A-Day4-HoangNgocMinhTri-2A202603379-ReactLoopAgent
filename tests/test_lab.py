@@ -1,13 +1,15 @@
 """Tests offline; FakeProvider là test double, không đánh giá năng lực model."""
 import json
+import io
 import sys
+import urllib.error
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from agent import run_agent
 from status_tools import StatusTools
-from providers import Provider
+from providers import Provider, post_json
 
 
 def tool_call(call_id, name, arguments):
@@ -80,6 +82,31 @@ class LoopTests(unittest.TestCase):
 
 
 class ProviderTests(unittest.TestCase):
+    @patch('providers.time.sleep')
+    @patch('providers.urllib.request.urlopen')
+    def test_post_json_retries_gemini_429_with_backoff(self, urlopen, sleep):
+        limited = urllib.error.HTTPError('https://example.invalid', 429, 'rate limited',
+                                         {}, io.BytesIO(b'{}'))
+        response = MagicMock()
+        response.__enter__.return_value = io.BytesIO(b'{"ok": true}')
+        urlopen.side_effect = [limited, limited, response]
+
+        url = 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions'
+        self.assertEqual(post_json(url, {}, {}), {'ok': True})
+        self.assertEqual(urlopen.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 2])
+
+    @patch('providers.time.sleep')
+    @patch('providers.urllib.request.urlopen')
+    def test_post_json_does_not_retry_other_http_errors(self, urlopen, sleep):
+        failure = urllib.error.HTTPError('https://example.invalid', 500, 'server error', {}, io.BytesIO(b'{}'))
+        urlopen.side_effect = failure
+
+        with self.assertRaisesRegex(RuntimeError, 'HTTP 500'):
+            post_json('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', {}, {})
+        urlopen.assert_called_once()
+        sleep.assert_not_called()
+
     @patch.dict('os.environ', {'ANTHROPIC_API_KEY': 'test'})
     @patch('providers.post_json')
     def test_anthropic_groups_results(self, post):
